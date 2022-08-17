@@ -7,6 +7,7 @@ For diagnostics app can accept a Get request from any web browser or console (fr
 availability:
 
 $ curl http://45.144.x.x:8989/webhook
+
 FROM: 120.1x.x.x:6844 TO: 45.144.x.x:8989/WEBHOOK
 
 This means service is available and ready to accept requests from github webhook 
