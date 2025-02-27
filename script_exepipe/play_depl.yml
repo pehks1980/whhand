@@ -1,0 +1,56 @@
+# Github -> Production Deployment
+#
+# Change vars to point to your own folders
+# These folders should exist on your production servers
+# my django project maap - is used to be deployed on a target server
+- name: Maap Backup before Deployment
+  connection: local
+  gather_facts: false
+  hosts: all
+  vars:
+    bu_repo_folder: /home/user/django/maap
+    bu_folder: /home/user/django
+
+  tasks:
+    - shell: _now=$(date +"%m_%d_%Y_%H_%M_%S"); tar -czvf archive_$_now.tar.gz {{ bu_repo_folder }}
+      args:
+        chdir: "{{ bu_folder }}"
+
+
+- name: Maap App Deployment from Github Repository
+  connection: local
+  gather_facts: false
+  hosts: all
+  vars:
+    repo_folder: /home/user/django/maap
+    repo_name: pehks1980/maap
+
+  tasks:
+    - git:
+        repo: ssh://git@github.com/{{ repo_name }}.git
+        dest: "{{ repo_folder }}"
+        update: yes
+        force: yes
+
+- name: Gunicorn Maap update pip requirements
+  connection: local
+  gather_facts: false
+  hosts: all
+  vars:
+    loc_repo_folder: /home/user/django/maap
+
+  tasks:
+    - shell: source /home/user/django/env/bin/activate && pip install --upgrade pip && pip install -r requirements.txt
+      args:
+        chdir: "{{ loc_repo_folder }}"
+        executable: /usr/bin/bash
+
+- name: Gunicorn Maap Restart svc
+  connection: local
+  gather_facts: false
+  hosts: all
+  tasks:
+    - shell: sudo systemctl restart gunicorn
+      become: true
+      become_user: user
+      become_method: sudo
