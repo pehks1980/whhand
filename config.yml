@@ -1,0 +1,10 @@
+port: "8989"  # Порт, на котором будет работать сервер
+
+jobs:
+  - webhook_path: "/webhook"  # Путь, на который приходит вебхук
+    secret: "my-secret-key-1980!A"  # Секрет для валидации
+    command: "echo \"ansible-playbook -i '192.168.31.204, ' /home/user/ansible/play_depl.yml\" > /export/my_exe_pipe"  # Команда для запуска Ansible
+
+  - webhook_path: "/webhook1"  
+    secret: "my-secret-key-1980!A"  
+    command: "ansible-playbook -i '192.168.31.204,' /home/user/ansible/play_depl.yml"

@@ -2,8 +2,10 @@
 HookHandler - listen for github webhooks, run ansible-playbooky deployment script
 it works when master branch push event !!!
 raspberry pi cross build:
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
-   go build -o whhand_arm main.go;\
+
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+	   go build -o whhand_arm main.go;\
+
 scp whhand_arm user@192.168.1.204:/home/user/ansible
 
 check from remote side diagnostics:
@@ -14,9 +16,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	_ "fmt"
-	"github.com/gorilla/mux"
 	"log"
 	"net"
 	"net/http"
@@ -27,28 +29,44 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gorilla/mux"
+	"gopkg.in/yaml.v2"
+
 	"github.com/google/go-github/github"
 )
+
+const ShellToUse = "/bin/sh" //"bash"
+
+// config to handle jobs
+type Job struct {
+	WebhookPath string `yaml:"webhook_path"`
+	Secret      string `yaml:"secret"`
+	Command     string `yaml:"command"`
+}
+
+// config to handle jobs
+type Config struct {
+	Port string `yaml:"port"`
+	Jobs []Job  `yaml:"jobs"`
+}
 
 // App - application contents & methods
 type App struct {
 	CTX    context.Context
-	cmdstr string
-	secret string
+	Config *Config
 }
 
-const ShellToUse = "/bin/sh" //"bash"
-// webhook secret
-const secret1 = "my-secret-key-1980!A"
-// port to listen
-const whport = "8989"
-
-// mode standalone app cmd to launch ansible
-const shellcmd2 = "ansible-playbook -i '192.168.31.204, ' /home/user/ansible/play_depl.yml"
-
-// docker container mode cmd to launch ansible should be sent to fifo pipe which should exist on mapped folder on host
-// (inner is 'export' for this case)
-const shellcmd1 = "echo \"ansible-playbook -i '192.168.31.204, ' /home/user/ansible/play_depl.yml\" > /export/my_exe_pipe"
+func loadConfig(filename string) (*Config, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	var config Config
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+	return &config, nil
+}
 
 func Shellout(command string) (string, string, error) {
 	var stdout bytes.Buffer
@@ -62,51 +80,26 @@ func Shellout(command string) (string, string, error) {
 
 func main() {
 
-	portDef := flag.String("webhook incoming port", whport, "WHPORT")
+	configFile := flag.String("config", "config.yml", "Path to configuration file")
+	flag.Parse()
 
-	port := os.Getenv("WHPORT")
-	if port == "" {
-		log.Printf("$WHPORT is not set. Using default: %s", *portDef)
-		port = *portDef
-	} else {
-		log.Printf("Using env $WHPORT = %s", port)
-	}
-
-	secretDef := flag.String("webhook incoming secret", secret1, "WHSECRET")
-
-	secret := os.Getenv("WHSECRET")
-	if secret == "" {
-		log.Printf("$WHSECRET is not set. Using default: ******")
-		secret = *secretDef
-	} else {
-		log.Printf("Using env $WHSECRET = %s", secret)
-	}
-
-	shutdownTimeout := flag.Int64("shutdown_timeout", 3, "shutdown timeout")
-    
-	log.Print("Starting the app for github webhook")
-
-	shellcmdDef := flag.String("webhook command", shellcmd1, "It can be also set as WHSHELLCMD.")
-
-    shellcmd := os.Getenv("WHSHELLCMD")
-	if shellcmd == "" {
-		log.Printf("$WHSHELLCMD is not set. Using default (for Docker): %s", *shellcmdDef)
-		shellcmd = *shellcmdDef
-	} else {
-		log.Printf("Using env $WHSHELLCMD = %s", shellcmd)
+	config, err := loadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
 
 	app := App{
 		CTX:    context.Background(),
-		cmdstr: shellcmd, //docker mode/standalone up to shell
-		secret: secret,
+		Config: config,
 	}
 
-	log.Printf("cmd: %s", app.cmdstr)
+	shutdownTimeout := flag.Int64("shutdown_timeout", 3, "shutdown timeout")
+
+	log.Print("Starting the app for github webhooks..")
 
 	serv := http.Server{
-		Addr:    net.JoinHostPort("", port),
-		Handler: app.RegisterPublicHTTP(),
+		Addr:    net.JoinHostPort("", app.Config.Port),
+		Handler: app.RegisterRoutesHTTP(),
 	}
 	// запуск сервера
 	go func() {
@@ -118,7 +111,7 @@ func main() {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 
-	log.Printf("Started app at :%s", port)
+	log.Printf("Started app at :%s", app.Config.Port)
 	// ждет сигнала
 	sig := <-interrupt
 
@@ -131,18 +124,27 @@ func main() {
 	}
 }
 
-// RegisterPublicHTTP - регистрация роутинга путей типа urls.py для обработки сервером
-func (app *App) RegisterPublicHTTP() *mux.Router {
+// RegisterRoutesHTTP - регистрация роутинга путей jobs для обработки сервером
+func (app *App) RegisterRoutesHTTP() *mux.Router {
 	r := mux.NewRouter()
-	// webhook
-	r.HandleFunc("/webhook", app.hookHandlerPost()).Methods(http.MethodPost)
-	// diag
-	r.HandleFunc("/webhook", app.hookHandlerGet()).Methods(http.MethodGet)
+
+	for _, job := range app.Config.Jobs {
+
+		localJob := job
+
+		// webhook
+		r.HandleFunc(localJob.WebhookPath, app.hookHandlerPost(localJob)).Methods(http.MethodPost)
+		// diag
+		r.HandleFunc(localJob.WebhookPath, app.hookHandlerGet()).Methods(http.MethodGet)
+
+	}
+
 	return r
 }
 
 // HookHandler parses GitHub webhooks and sends an update to DeploymentMonitor.
-func (app *App) hookHandlerPost() func(http.ResponseWriter, *http.Request) {
+// per each job from config yml
+func (app *App) hookHandlerPost(job Job) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		/*
 			payload, err := ioutil.ReadAll(r.Body)
@@ -151,16 +153,18 @@ func (app *App) hookHandlerPost() func(http.ResponseWriter, *http.Request) {
 				return
 			}
 		*/
-		payload, err := github.ValidatePayload(r, []byte(app.secret))
+		payload, err := github.ValidatePayload(r, []byte(job.Secret))
 		if err != nil {
-			log.Printf("error validating request body: err=%s\n", err)
+			log.Printf("Invalid payload: %v", err)
+			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		defer r.Body.Close()
 
 		event, err := github.ParseWebHook(github.WebHookType(r), payload)
 		if err != nil {
-			log.Printf("could not parse webhook: err=%s\n", err)
+			log.Printf("Webhook parse error: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
@@ -183,7 +187,7 @@ func (app *App) hookHandlerPost() func(http.ResponseWriter, *http.Request) {
 			if branch == "master" {
 				go func() {
 					log.Printf("master branch push event, sha: %s", *e.After)
-					out, errout, err := Shellout(app.cmdstr)
+					out, errout, err := Shellout(job.Command)
 					if err != nil {
 						log.Printf("error: %v\n", err)
 					}
@@ -193,7 +197,7 @@ func (app *App) hookHandlerPost() func(http.ResponseWriter, *http.Request) {
 			}
 			return
 		default:
-			log.Printf("unknown WebHookType: %s, webhook-id: %s skipping\n", github.WebHookType(r), r.Header.Get("X-GitHub-Delivery"))
+			log.Printf("unknown WebHookType: %s, webhook-id: %s skipping", github.WebHookType(r), r.Header.Get("X-GitHub-Delivery"))
 			return
 		}
 	}
@@ -204,14 +208,10 @@ func (app *App) hookHandlerGet() func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 
-		line := "from: " + r.RemoteAddr + " to: " + r.Host + r.URL.String()
+		line := "from: " + r.RemoteAddr + " to: " + r.Host + r.URL.String() + " ok! "
 		log.Printf("diag test is OK - received message: %s\n", line)
-		writeResponse(w, http.StatusOK, strings.ToUpper(line))
-	}
-}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": strings.ToUpper(line)})
 
-func writeResponse(w http.ResponseWriter, status int, message string) {
-	w.WriteHeader(status)
-	_, _ = w.Write([]byte(message))
-	_, _ = w.Write([]byte("\n"))
+	}
 }
