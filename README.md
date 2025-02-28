@@ -17,7 +17,7 @@ $ curl http://so.ur.ce.ip:8989/webhook
 
 If its ok, you'll get response alike:
 
-{"status":"FROM: 127.0.0.1:56460 TO: 127.0.0.1:8989/WEBHOOK1 OK! "}
+{"status":"FROM: 127.0.0.1:56460 TO: 127.0.0.1:8989/WEBHOOK OK! "}
 
 This means service is available and ready to accept requests from github webhook 
 events.
@@ -41,7 +41,13 @@ Script exepipe.sh (located in folder script_exepipe) has to be run on host
 to execute commands from docker conansible playbook (or whatever). 
 It waits for command from docker app container on this pipe and executes it.
 
-New version can update a few hooks so it it useful when you got 2 or more repos to deploy. A typical config.yml:
+
+## Configuration
+
+The application uses a YAML configuration file to define multiple webhook jobs.
+
+### Example `config.yml`
+```yaml
 
 port: "8989"  # listen of your server port
 
