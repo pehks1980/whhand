@@ -1,16 +1,16 @@
 FROM golang:1.23 AS modules
 
-ADD go.mod go.sum /m/
-RUN cd /m && go mod download
+WORKDIR /m
+ADD go.mod go.sum ./
+RUN go mod download
+
 #cpy folder from modules to builder
 FROM golang:1.23 AS builder
 COPY --from=modules /go/pkg /go/pkg
-#mkdir if its doesnt exist yet
-RUN mkdir -p /whhand
-
-ADD . /whhand
-
+#will be created if not exists
 WORKDIR /whhand
+ADD . ./
+
 #do things under unpriveleged 'user'
 RUN useradd -u 1001 user
 # Собираем бинарный файл GOARCH=arm64 pi | amd64 x86
@@ -26,12 +26,15 @@ COPY --from=builder /etc/passwd /etc/passwd
 # because program creates file inside we need to use image alpine which has commands to
 # we make special dir with user rights
 # otherwise exec cant create anything - perm denied as it creates process under this user
-RUN mkdir -p /whhand
-RUN chown user /whhand
-USER user
-WORKDIR /whhand
 
-# exe file has to have its own name different from dir!
+RUN mkdir -p /whhand && chown user /whhand
+
+USER user
+#under user must be set 
+WORKDIR /whhand
+#cpy config.yml to container
+ADD config.yml ./
+#copy main form builder
 COPY --from=builder /main /whhand/main
 # starting pathfile of the container
 CMD ["/whhand/main"]
