@@ -1,67 +1,185 @@
-# whhand (webhook handler go)
-Microservice GO runs as docker container (can work standalone as well) waits for github webhook event (with secret) then runs ansible playbook with some actions to deploy repo, 
-make backups, restart service. To work properly with github, service has to have access to Internet IP address, so if it's IP inside, 
-a firewall policy (TCP PORT REDIRECT) should be able to redirect Github Webhook http post requests to that IP inside. It also can be done by setting up SSH portforwarding but this is out of the scope. Check the AI or Internet how to do it.
+# whhand
 
-If iptables is used as firewall, the following Rule that redirects requests 
-from Host with Internet IP to IP inside (this case port 8989, IP inside 10.x.x.x):
+`whhand` is a small Go webhook handler for GitHub push events. It validates the
+GitHub webhook signature, checks that the push is for the `master` branch, and
+then runs a configured deployment command.
 
-sudo iptables -A PREROUTING -p tcp -m tcp --dport 8989 -j DNAT --to-destination 10.x.x.x:8989
+The project is designed for small servers such as Raspberry Pi devices, where a
+full CI/CD system may be more than you need. It can run directly on the host or
+inside Docker.
 
-For diagnostics app can accept a Get request from any web browser or console (from outside IP) so it can check its IP network
-availability:
+## How It Works
 
-For eg IP 45.144.x.x is Internet Address of your side for github webhooks:
+1. GitHub sends a webhook request to one of the configured webhook paths.
+2. `whhand` validates the request using the job secret from the YAML config.
+3. If the event is a push to `master`, the job command is executed.
+4. Deployment commands are serialized so that two pushes do not run overlapping
+   deployments.
 
-$ curl http://so.ur.ce.ip:8989/webhook
-
-If its ok, you'll get response alike:
-
-{"status":"FROM: 127.0.0.1:56460 TO: 127.0.0.1:8989/WEBHOOK OK! "}
-
-This means service is available and ready to accept requests from github webhook 
-events.
-
-Necessary actions (ie ansible playbook, or whatever you need of such type) will 
-be executed (if you set fifo pipe on your host, and execute script exepipe.sh).
-Example deployment playbook for a Python Django project is in script_exepipe folder.
-
-
-When run as docker container, playbook on host system can be run via fifo pipe 
-which is created on a mapped folder, in this case docker container can be run as:
-
-#### docker run -p 8989:8989 -v /home/user/ansible:/export -d whhand:arm64
-
-Host folder eg /home/user/ansible maps into container as eg /export 
-
-Pipe is created (in the host folder) by: 
-#### mkfifo my_exe_pipe
-
-Script exepipe.sh (located in folder script_exepipe) has to be run on host 
-to execute commands from docker conansible playbook (or whatever). 
-It waits for command from docker app container on this pipe and executes it.
-
+When running in Docker, the container can write a command to a FIFO pipe mounted
+from the host. The host runs `script_exepipe/exepipe.sh`, reads the command from
+that pipe, validates it, and executes it locally.
 
 ## Configuration
 
-The application uses a YAML configuration file to define multiple webhook jobs.
+The application uses a YAML config file. By default it reads `config.yml` from
+the current working directory. You can override this with the `CONFIG`
+environment variable.
 
-### Example `config.yml`
+Docker images default to:
+
+```sh
+CONFIG=/export/config.yml
+```
+
+Example:
+
 ```yaml
-
-port: "8989"  # listen of your server port
+port: "8989"
 
 jobs:
-  - webhook_path: "/webhooka"  # path for webhook application "a"
-    secret: "my-secret-key-1980!A"  # secret set on github side in webhook's settings
-    command: "echo \"ansible-playbook -i '192.168.31.204, ' /home/user/ansible/play_depl.yml\" > /export/my_exe_pipe"  # Ansible deploy playbook
+  - webhook_path: "/webhook"
+    secret: "my-github-webhook-secret"
+    command: "echo \"ansible-playbook -i '192.168.31.204,' /home/user/ansible/play_depl.yml\" > /export/my_exe_pipe"
 
-  - webhook_path: "/webhookb"  # app "b" and so on
-    secret: "my-secret-key-1980!B"  
-    command: "ansible-playbook -i '192.168.31.204,' /home/user/ansible/play_depl.yml"
+  - webhook_path: "/webhook-other"
+    secret: "my-other-github-webhook-secret"
+    command: "echo \"ansible-playbook -i '192.168.31.204,' /home/user/ansible/play_depl_other.yml\" > /export/my_exe_pipe"
+```
 
+Config fields:
 
+- `port`: TCP port for the HTTP server.
+- `jobs[].webhook_path`: URL path for this webhook, for example `/webhook`.
+- `jobs[].secret`: GitHub webhook secret for request validation.
+- `jobs[].command`: command executed after a valid `master` branch push.
 
-Yes, You can do all this CI&CD pipline using Jenkins, 
-but this tool is a tiny docker container - can do the same thing being installed on Raspberry pi, 
-or similar IOT systems which don't naturally have many recources.
+## GitHub Webhook Setup
+
+In the GitHub repository settings:
+
+1. Open `Settings` -> `Webhooks` -> `Add webhook`.
+2. Set the payload URL, for example `http://your.server.ip:8989/webhook`.
+3. Set `Content type` to `application/json`.
+4. Set `Secret` to the same value used in `config.yml`.
+5. Select push events.
+
+The service currently deploys only pushes to the `master` branch.
+
+## Run Locally
+
+```sh
+go run . -config script_exepipe/config.yml
+```
+
+You can also use the environment variable:
+
+```sh
+CONFIG=script_exepipe/config.yml go run .
+```
+
+Optional shutdown timeout:
+
+```sh
+go run . -config script_exepipe/config.yml -shutdown_timeout 5
+```
+
+## Run With Docker
+
+Build for the current platform:
+
+```sh
+docker build -t whhand .
+```
+
+Run with a host directory mounted as `/export`:
+
+```sh
+docker run -p 8989:8989 -v /home/user/ansible:/export -d whhand
+```
+
+The mounted host directory should contain:
+
+- `config.yml`
+- `my_exe_pipe`
+- any playbooks or scripts used by the deployment command
+
+Create the FIFO pipe on the host:
+
+```sh
+mkfifo /home/user/ansible/my_exe_pipe
+```
+
+For Raspberry Pi or another ARM64 target:
+
+```sh
+docker buildx build --platform linux/arm64 -t whhand:arm64 .
+```
+
+## Host-Side Command Runner
+
+If the container writes commands into `/export/my_exe_pipe`, run the pipe reader
+on the host:
+
+```sh
+script_exepipe/exepipe.sh
+```
+
+The script logs to:
+
+```sh
+/home/user/ansible/exepipe.log
+```
+
+By default, `exepipe.sh` allows `ansible-playbook` commands. You can override
+the allowlist:
+
+```sh
+ALLOWED_CMDS="ansible-playbook /usr/bin/ansible-playbook" script_exepipe/exepipe.sh
+```
+
+The script rejects shell control characters such as `;`, `&`, `|`, redirects,
+command substitution, and environment expansion before executing a command.
+
+## Diagnostics
+
+Each configured webhook path also accepts `GET` requests as a simple health
+check:
+
+```sh
+curl http://your.server.ip:8989/webhook
+```
+
+Example response:
+
+```json
+{"status":"FROM: 127.0.0.1:56460 TO: 127.0.0.1:8989/WEBHOOK OK! "}
+```
+
+## Network Notes
+
+GitHub must be able to reach the webhook endpoint. If the service runs on a
+private network, configure port forwarding from a public address to the internal
+host.
+
+Example `iptables` redirect:
+
+```sh
+sudo iptables -t nat -A PREROUTING -p tcp --dport 8989 -j DNAT --to-destination 10.x.x.x:8989
+```
+
+Your exact firewall and NAT setup will depend on your network.
+
+## Development
+
+Run tests:
+
+```sh
+go test ./...
+```
+
+Run vet:
+
+```sh
+go vet ./...
+```
