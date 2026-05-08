@@ -8,47 +8,47 @@ log_file="$home_dir/exepipe.log"
 [ ! -f "$log_file" ] && touch "$log_file"
 [ ! -e "$home_dir/my_exe_pipe" ] && echo "Pipe file not found: $home_dir/my_exe_pipe, exiting." && exit 1
 
-# Dangerous command blocklist
-declare -a DANGEROUS_CMDS=("rm" "dd" "mkfs" "shred" "wipe" "fdisk" "parted" "shutdown" "reboot" "halt" "poweroff" "kill" "killall" ":(){:|:&")
-
-# Allowed command whitelist (optional - use if you want strict control)
-declare -a ALLOWED_CMDS=("echo" "ls" "pwd" "cat" "grep" "sed" "awk" "date" "ps" "df" "uptime" "hostname" "whoami")
+# Allowed command whitelist. Override with:
+# ALLOWED_CMDS="ansible-playbook /usr/bin/ansible-playbook" ./exepipe.sh
+declare -a DEFAULT_ALLOWED_CMDS=("ansible-playbook")
+if [[ -n "${ALLOWED_CMDS:-}" ]]; then
+    read -r -a ALLOWED_CMD_LIST <<< "$ALLOWED_CMDS"
+else
+    declare -a ALLOWED_CMD_LIST=("${DEFAULT_ALLOWED_CMDS[@]}")
+fi
 
 dt=$(date '+%Y-%m-%d %H:%M:%S')
 echo "$dt INFO: exepipe started." >> "$log_file"
 
 validate_command() {
     local cmd="$1"
-    
+
+    case "$cmd" in
+        *";"*|*"&"*|*"|"*|*"<"*|*">"*|*'$('*|*'`'*|*'$'*)
+            return 1
+            ;;
+    esac
+
     # Extract the first word (the actual command)
     local cmd_name="${cmd%% *}"
-    
+
     # Remove path to get just the executable name (e.g., /bin/rm -> rm)
     cmd_name="${cmd_name##*/}"
-    
-    # Check against dangerous commands
-    for danger in "${DANGEROUS_CMDS[@]}"; do
-        if [[ "$cmd_name" == "$danger" ]]; then
-            return 1  # Command is dangerous
+
+    for safe in "${ALLOWED_CMD_LIST[@]}"; do
+        if [[ "$cmd_name" == "$safe" || "${cmd%% *}" == "$safe" ]]; then
+            return 0
         fi
     done
-    
-    # Optional: Check against whitelist if you want strict control
-    # Uncomment the section below if you want ONLY whitelisted commands
-    # local allowed=0
-    # for safe in "${ALLOWED_CMDS[@]}"; do
-    #     if [[ "$cmd_name" == "$safe" ]]; then
-    #         allowed=1
-    #         break
-    #     fi
-    # done
-    # [ $allowed -eq 0 ] && return 1
-    
-    return 0  # Command is safe
+
+    return 1
 }
 
 while true; do
-    cmd=$(cat "$home_dir/my_exe_pipe")
+    if ! IFS= read -r cmd < "$home_dir/my_exe_pipe"; then
+        sleep 1
+        continue
+    fi
     
     # Skip empty commands
     [ -z "$cmd" ] && sleep 1 && continue
@@ -57,7 +57,7 @@ while true; do
     
     # Validate command
     if ! validate_command "$cmd"; then
-        echo "$dt WARN: Blocked dangerous command: $cmd" >> "$log_file"
+        echo "$dt WARN: Blocked command: $cmd" >> "$log_file"
         sleep 1
         continue
     fi

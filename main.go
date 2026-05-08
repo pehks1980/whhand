@@ -17,8 +17,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
-	_ "fmt"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,8 +54,9 @@ type Config struct {
 
 // App - application contents & methods
 type App struct {
-	CTX    context.Context
-	Config *Config
+	CTX      context.Context
+	Config   *Config
+	DeployMu sync.Mutex
 }
 
 func loadConfig(filename string) (*Config, error) {
@@ -65,7 +68,41 @@ func loadConfig(filename string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
+	if err := validateConfig(&config); err != nil {
+		return nil, err
+	}
 	return &config, nil
+}
+
+func validateConfig(config *Config) error {
+	if strings.TrimSpace(config.Port) == "" {
+		return fmt.Errorf("port is required")
+	}
+	if len(config.Jobs) == 0 {
+		return fmt.Errorf("at least one job is required")
+	}
+
+	paths := make(map[string]struct{}, len(config.Jobs))
+	for i, job := range config.Jobs {
+		if strings.TrimSpace(job.WebhookPath) == "" {
+			return fmt.Errorf("jobs[%d].webhook_path is required", i)
+		}
+		if !strings.HasPrefix(job.WebhookPath, "/") {
+			return fmt.Errorf("jobs[%d].webhook_path must start with /", i)
+		}
+		if strings.TrimSpace(job.Secret) == "" {
+			return fmt.Errorf("jobs[%d].secret is required", i)
+		}
+		if strings.TrimSpace(job.Command) == "" {
+			return fmt.Errorf("jobs[%d].command is required", i)
+		}
+		if _, ok := paths[job.WebhookPath]; ok {
+			return fmt.Errorf("duplicate webhook_path %q", job.WebhookPath)
+		}
+		paths[job.WebhookPath] = struct{}{}
+	}
+
+	return nil
 }
 
 func Shellout(command string) (string, string, error) {
@@ -80,10 +117,19 @@ func Shellout(command string) (string, string, error) {
 
 func main() {
 
-	configFile := flag.String("config", "config.yml", "Path to configuration file")
+	configFileDef := flag.String("config", "config.yml", "Path to configuration file")
+	shutdownTimeout := flag.Int64("shutdown_timeout", 3, "shutdown timeout")
 	flag.Parse()
 
-	config, err := loadConfig(*configFile)
+	configFile := os.Getenv("CONFIG")
+	if configFile == "" {
+		log.Printf("Env CONFIG is not set. Using default: %s", *configFileDef)
+		configFile = *configFileDef
+	} else {
+		log.Printf("Using env CONFIG = %s", configFile)
+	}
+
+	config, err := loadConfig(configFile)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
@@ -93,29 +139,39 @@ func main() {
 		Config: config,
 	}
 
-	shutdownTimeout := flag.Int64("shutdown_timeout", 3, "shutdown timeout")
-
 	log.Print("Starting the app for github webhooks..")
 
 	serv := http.Server{
-		Addr:    net.JoinHostPort("", app.Config.Port),
-		Handler: app.RegisterRoutesHTTP(),
+		Addr:              net.JoinHostPort("", app.Config.Port),
+		Handler:           app.RegisterRoutesHTTP(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	serverErr := make(chan error, 1)
 	// запуск сервера
 	go func() {
-		if err := serv.ListenAndServe(); err != nil {
-			log.Fatalf("listen and serve err: %v", err)
+		if err := serv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
 		}
 	}()
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
+	defer signal.Stop(interrupt)
 
 	log.Printf("Started app at :%s", app.Config.Port)
-	// ждет сигнала
-	sig := <-interrupt
 
-	log.Printf("Sig: %v, stopping app", sig)
+	// ждет сигнала
+	select {
+	case err := <-serverErr:
+		log.Fatalf("listen and serve err: %v", err)
+	case sig := <-interrupt:
+		log.Printf("Sig: %v, stopping app", sig)
+	}
+
 	// шат даун по контексту с тайм аутом
 	ctx, cancel := context.WithTimeout(app.CTX, time.Duration(*shutdownTimeout)*time.Second)
 	defer cancel()
@@ -153,13 +209,15 @@ func (app *App) hookHandlerPost(job Job) func(http.ResponseWriter, *http.Request
 				return
 			}
 		*/
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		defer r.Body.Close()
+
 		payload, err := github.ValidatePayload(r, []byte(job.Secret))
 		if err != nil {
 			log.Printf("Invalid payload: %v", err)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		defer r.Body.Close()
 
 		event, err := github.ParseWebHook(github.WebHookType(r), payload)
 		if err != nil {
@@ -173,20 +231,29 @@ func (app *App) hookHandlerPost(job Job) func(http.ResponseWriter, *http.Request
 			var commitMessage string
 			if e.Commit != nil {
 				if e.Commit.Commit != nil {
-					commitMessage = *e.Commit.Commit.Message
+					commitMessage = stringValue(e.Commit.Commit.Message)
 				}
 			}
-			log.Printf("CommitUpdate status: %s, sha: %s, message: %s", *e.State, *e.SHA, commitMessage)
+			log.Printf("CommitUpdate status: %s, sha: %s, message: %s", stringValue(e.State), stringValue(e.SHA), commitMessage)
 			return
 		case *github.PullRequestEvent:
 			// action when pull
 			return
 		case *github.PushEvent:
-			ref := *e.Ref
+			ref := stringValue(e.Ref)
+			if !strings.HasPrefix(ref, "refs/heads/") {
+				log.Printf("push event has unsupported ref: %s", ref)
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
 			branch := ref[len("refs/heads/"):]
 			if branch == "master" {
+				sha := stringValue(e.After)
 				go func() {
-					log.Printf("master branch push event, sha: %s", *e.After)
+					app.DeployMu.Lock()
+					defer app.DeployMu.Unlock()
+
+					log.Printf("master branch push event, sha: %s", sha)
 					out, errout, err := Shellout(job.Command)
 					if err != nil {
 						log.Printf("error: %v\n", err)
@@ -195,12 +262,20 @@ func (app *App) hookHandlerPost(job Job) func(http.ResponseWriter, *http.Request
 					log.Printf("--- stderr ---: %s", errout)
 				}()
 			}
+			w.WriteHeader(http.StatusAccepted)
 			return
 		default:
 			log.Printf("unknown WebHookType: %s, webhook-id: %s skipping", github.WebHookType(r), r.Header.Get("X-GitHub-Delivery"))
 			return
 		}
 	}
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // check app is responding

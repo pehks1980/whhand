@@ -6,16 +6,18 @@ RUN go mod download
 
 #cpy folder from modules to builder
 FROM golang:1.23 AS builder
+ARG TARGETOS=linux
+ARG TARGETARCH=arm64
 COPY --from=modules /go/pkg /go/pkg
 #will be created if not exists
 WORKDIR /whhand
-ADD . ./
+COPY . ./
 
 #do things under unpriveleged 'user'
 RUN useradd -u 1001 user
 # Собираем бинарный файл GOARCH=arm64 pi | amd64 x86
 # main - это результирующий exe файл в корне билдера
-RUN GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o /main
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 go build -o /main
 #chown exe to be owned by user
 RUN chown user /main
 
@@ -33,9 +35,11 @@ USER user
 #under user must be set 
 WORKDIR /whhand
 #cpy config.yml to container
-ADD config.yml ./
+#ADD config.yml ./ now it vie env CONFIG
+ENV CONFIG=/export/config.yml
 #copy main form builder
 COPY --from=builder /main /whhand/main
+EXPOSE 8989
 # starting pathfile of the container
 CMD ["/whhand/main"]
 
@@ -63,3 +67,5 @@ CMD ["/whhand/main"]
 # docker login -u pehks1980 (pswd)
 # docker tag  whhand:arm64 pehks1980/repo2:whhand_1
 # docker push pehks1980/repo2:whhand_1
+# on other side docker-compose pull whhand
+# docker-compose up -d --no-deps whhand
